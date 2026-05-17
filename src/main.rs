@@ -1,10 +1,23 @@
-use std::collections::HashMap;
+use cached::{Cached as _, TimedCache};
+use poise::serenity_prelude as serenity;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Write as _,
+    io::Write as _,
+    sync::Arc,
+    time::Duration,
+};
+use tabwriter::TabWriter;
+use tokio::sync::{Mutex, RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
+use tracing::{error, info, warn};
 
 use anyhow::Context as _;
 use clap::Parser;
 use once_cell::sync::Lazy;
-use reqwest::Url;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer};
+use reqwest::{IntoUrl, Url};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+
+const REGISTRY: &str = "registry.json";
 
 static API_URL: Lazy<Url> = Lazy::new(|| {
     Url::parse("https://api.cloudflare.riftbound.uvsgames.com/hydraproxy/api/v2/")
@@ -36,7 +49,7 @@ fn tournament_rounds_url(event_id: u32) -> Url {
         .join(&format!("{event_id}/"))
         .expect("invalid path")
 }
-fn matches_url(event_id: u32, page_size: u32, page: u32) -> Url {
+fn matches_url(event_id: u32, page_size: usize, page: u32) -> Url {
     let mut url = tournament_rounds_url(event_id)
         .join("matches/paginated/")
         .expect("invalid path");
@@ -47,14 +60,21 @@ fn matches_url(event_id: u32, page_size: u32, page: u32) -> Url {
 
     url
 }
-fn standings_url(event_id: u32, page_size: u32, page: u32) -> Url {
+fn standings_url(event_id: u32, page_size: usize, page: u32, player_name: Option<&str>) -> Url {
     let mut url = tournament_rounds_url(event_id)
         .join("standings/paginated/")
         .expect("invalid path");
 
-    url.query_pairs_mut()
-        .append_pair("page_size", &page_size.to_string())
-        .append_pair("page", &page.to_string());
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("page_size", &page_size.to_string())
+            .append_pair("page", &page.to_string());
+
+        if let Some(name) = player_name {
+            query.append_pair("player_name", name);
+        }
+    }
 
     url
 }
@@ -116,15 +136,15 @@ struct PaginationResult<Result> {
 trait Paginated {
     type Single: DeserializeOwned;
 
-    fn page_url(id: u32, page_size: u32, page: u32) -> Url;
+    fn page_url(id: u32, page_size: usize, page: u32) -> Url;
     fn construct(pages: Vec<Vec<Self::Single>>) -> Self;
 }
 
 impl Paginated for Standings {
     type Single = StandingsResult;
 
-    fn page_url(id: u32, page_size: u32, page: u32) -> Url {
-        standings_url(id, page_size, page)
+    fn page_url(id: u32, page_size: usize, page: u32) -> Url {
+        standings_url(id, page_size, page, None)
     }
 
     fn construct(pages: Vec<Vec<StandingsResult>>) -> Standings {
@@ -245,7 +265,7 @@ struct Matches {
 impl Paginated for Matches {
     type Single = Match;
 
-    fn page_url(id: u32, page_size: u32, page: u32) -> Url {
+    fn page_url(id: u32, page_size: usize, page: u32) -> Url {
         matches_url(id, page_size, page)
     }
 
@@ -342,28 +362,62 @@ struct Cmd {
     by_rank: Option<usize>,
 }
 
-async fn get_tournament(event_id: u32) -> anyhow::Result<Event> {
-    Ok(reqwest::get(event_url(event_id))
+async fn get_cached<T: IntoUrl, Data: DeserializeOwned>(url: T) -> anyhow::Result<Data> {
+    static CACHE: Lazy<Arc<Mutex<TimedCache<Url, String>>>> = Lazy::new(|| {
+        Arc::new(Mutex::new(TimedCache::with_lifespan(Duration::from_mins(
+            15,
+        ))))
+    });
+
+    let url = url.into_url().context("Not a valid url")?;
+    let mut cache = CACHE.lock().await;
+
+    if let Some(result) = cache.cache_get(&url) {
+        match serde_json::from_str(result) {
+            Ok(parsed) => return Ok(parsed),
+            Err(e) => {
+                error!("Could not parse cached data: {e}.");
+                warn!("Invalidating cache for {url}");
+                cache.cache_remove(&url);
+            }
+        }
+    }
+
+    info!("Fetching {url} (not cached)");
+    let result = reqwest::get(url.clone())
         .await
-        .context("failed to load tournament info")?
-        .json()
-        .await?)
+        .with_context(|| format!("failed to load url: {url}"))?
+        .text()
+        .await
+        .with_context(|| format!("could not read body of {url}"))?;
+
+    let result_parsed = serde_json::from_str(&result.clone())?;
+
+    cache.cache_set(url, result);
+
+    Ok(result_parsed)
+}
+
+async fn get_tournament(event_id: u32) -> anyhow::Result<Event> {
+    get_cached(event_url(event_id)).await
 }
 
 async fn get_paginated<P: Paginated>(id: u32, max: Option<usize>) -> anyhow::Result<P> {
     let mut pages = Vec::new();
 
     let mut total = 0;
-    let mut next_page = Some(1);
+    let mut next_page = Some(1_u32);
     while let Some(page) = next_page {
-        let req = P::page_url(id, 500, page);
-        println!("Requesting: {req}");
-        let page: PaginationResult<<P as Paginated>::Single> = reqwest::get(req)
-            .await
-            .context("Could not load page")?
-            .json()
-            .await
-            .context("Failed to parse page")?;
+        let req = P::page_url(
+            id,
+            if let Some(max) = max {
+                usize::min(500, max - total)
+            } else {
+                500
+            },
+            page,
+        );
+        let page: PaginationResult<<P as Paginated>::Single> = get_cached(req).await?;
         total += page.results.len();
         pages.push(page.results);
 
@@ -379,24 +433,107 @@ async fn get_paginated<P: Paginated>(id: u32, max: Option<usize>) -> anyhow::Res
     Ok(P::construct(pages))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Cmd::parse();
+#[derive(Default, Serialize, Deserialize)]
+struct ChannelData {
+    current_event: Option<u32>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct GuildData {
+    channels: BTreeMap<serenity::ChannelId, ChannelData>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Data {
+    guilds: BTreeMap<Option<serenity::GuildId>, GuildData>,
+}
+
+struct GlobalState {
+    data: RwLock<Data>,
+}
+
+type Context<'a> = poise::Context<'a, GlobalState, anyhow::Error>;
+
+trait ContextExt {
+    async fn channel_data(&self) -> Option<RwLockReadGuard<'_, ChannelData>>;
+    async fn channel_data_mut(&self) -> RwLockMappedWriteGuard<'_, ChannelData>;
+    async fn persist_data(&self) -> anyhow::Result<()>;
+}
+impl<'a> ContextExt for Context<'a> {
+    async fn channel_data(&self) -> Option<RwLockReadGuard<'_, ChannelData>> {
+        RwLockReadGuard::try_map(self.data().data.read().await, |data| {
+            data.guilds
+                .get(&self.guild_id())?
+                .channels
+                .get(&self.channel_id())
+        })
+        .ok()
+    }
+
+    async fn channel_data_mut(&self) -> RwLockMappedWriteGuard<'_, ChannelData> {
+        RwLockWriteGuard::map(self.data().data.write().await, |data| {
+            data.guilds
+                .entry(self.guild_id())
+                .or_insert(GuildData::default())
+                .channels
+                .entry(self.channel_id())
+                .or_insert(ChannelData::default())
+        })
+    }
+
+    async fn persist_data(&self) -> anyhow::Result<()> {
+        let mut output = std::fs::File::create(REGISTRY).context("cannot open registry file")?;
+        serde_json::to_writer_pretty(&mut output, &*self.data().data.read().await)
+            .context("could not write to json")?;
+
+        Ok(())
+    }
+}
+
+#[poise::command(slash_command)]
+async fn current_event(ctx: Context<'_>, event_url: String) -> anyhow::Result<()> {
+    ctx.defer_ephemeral().await?;
+
     let event_re =
-        regex::Regex::new(r"(https://)?locator.riftbound.uvsgames.com/events/(?<id>[^/]*)")
+        regex::Regex::new(r"(https?://)?locator.riftbound.uvsgames.com/events/(?<id>[^/]*)")
             .expect("bad regex");
 
-    let event_id = if let Some(caps) = event_re.captures(&args.tourney_url) {
-        caps["id"].parse().context("event id is not a number")?
-    } else {
-        return Err(anyhow::anyhow!("Could not parse provided tournament url"));
-    };
+    {
+        let mut data = ctx.channel_data_mut().await;
+        data.current_event = Some(if let Some(caps) = event_re.captures(&event_url) {
+            caps["id"].parse().context("event id is not a number")?
+        } else {
+            return Err(anyhow::anyhow!("Could not parse provided tournament url"));
+        });
 
-    let tournament = get_tournament(event_id).await?;
+        ctx.reply(format!("Tournament: {:?}", data.current_event))
+            .await?;
+    }
 
-    println!("Reading standings for: {}", tournament.name);
+    ctx.persist_data().await?;
 
-    let completed_phase = tournament
+    Ok(())
+}
+
+#[poise::command(slash_command)]
+async fn standings(
+    ctx: Context<'_>,
+    player: Option<String>,
+    count: Option<usize>,
+) -> anyhow::Result<()> {
+    let locked = ctx
+        .channel_data()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+    let event_id = locked
+        .current_event
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+
+    let event = get_tournament(event_id).await?;
+
+    ctx.defer().await?;
+
+    let completed_phase = event
         .tournament_phases
         .iter()
         .rfind(|p| {
@@ -406,79 +543,101 @@ async fn main() -> anyhow::Result<()> {
                     .any(|r| matches!(r.status, RoundStatus::Complete))
         })
         .ok_or_else(|| anyhow::anyhow!("No candidate phase found"))?;
-    let running_phase = tournament
-        .tournament_phases
-        .iter()
-        .rfind(|p| {
-            matches!(p.status, RoundStatus::Complete | RoundStatus::InProgress)
-                && p.rounds
-                    .iter()
-                    .any(|r| matches!(r.status, RoundStatus::Complete | RoundStatus::InProgress))
-        })
-        .ok_or_else(|| anyhow::anyhow!("No in-progress phase"))?;
-
-    println!("Phase: {}", completed_phase.phase_name);
 
     let complete_round = completed_phase
         .rounds
         .iter()
         .rfind(|p| matches!(p.status, RoundStatus::Complete))
         .ok_or_else(|| anyhow::anyhow!("No complete round found"))?;
-    let running_round = running_phase
-        .rounds
-        .iter()
-        .rfind(|p| matches!(p.status, RoundStatus::Complete | RoundStatus::InProgress))
-        .ok_or_else(|| anyhow::anyhow!("No running round found"))?;
 
-    println!("Completed Round {}", complete_round.round_number);
-    println!("Running Round {}", running_round.round_number);
-
-    let matches: Matches = get_paginated(running_round.id, None).await?;
-    for mat in matches.matches {
-        println!("{} -> {:?}", mat.id, mat.results);
-    }
-    return Ok(());
-
-    let standings: Standings = get_paginated(complete_round.id, args.by_rank).await?;
-
-    for standing in standings.standings.iter().filter(|s| {
-        if let Some(legend) = &args.by_legend {
-            if let Some(player_legend) = s
-                .user_event_status
-                .deck_defining_card
-                .as_ref()
-                .map(|ddc| &ddc.name)
-            {
-                if legend != player_legend {
-                    return false;
-                }
-            } else {
-                return false;
-            }
+    let standings: Standings = if let Some(player) = player {
+        let result: PaginationResult<StandingsResult> = get_cached(standings_url(
+            complete_round.id,
+            count.unwrap_or(20),
+            1,
+            Some(&player),
+        ))
+        .await?;
+        Standings {
+            standings: result.results,
         }
+    } else {
+        get_paginated(complete_round.id, Some(count.unwrap_or(20))).await?
+    };
 
-        if let Some(rank) = args.by_rank {
-            if s.rank > rank {
-                return false;
-            }
-        }
-
-        true
-    }) {
-        println!(
-            "{} - {} - {} ({}): {}",
+    let mut tw = TabWriter::new(vec![]).padding(2);
+    writeln!(&mut tw, "#\tPlayer\tRecord\tLegend")?;
+    for standing in standings.standings {
+        writeln!(
+            &mut tw,
+            "{}\t{}\t{}\t{}",
             standing.rank,
-            standing.record,
             standing.user_event_status.best_identifier,
-            standing.player.best_identifier,
+            standing.record,
             standing
                 .user_event_status
                 .deck_defining_card
                 .as_ref()
                 .map(|ddc| ddc.name.as_str())
-                .unwrap_or("UNKNOWN LEGEND")
-        );
+                .unwrap_or("UNKNOWN LEGEND"),
+        )?;
     }
+    tw.flush()?;
+    let written = String::from_utf8(tw.into_inner()?)?;
+    let mut lines = written.lines();
+    let header = lines.next().unwrap();
+    let mut body = String::new();
+    let mut longest = 0;
+    for line in lines {
+        longest = usize::max(longest, line.len());
+        writeln!(&mut body, "{line}")?;
+    }
+
+    ctx.reply(format!(
+        "# {}\nStandings as of round {}```\n{header}\n{}\n{body}\n```",
+        event.name,
+        complete_round.round_number,
+        "─".repeat(longest)
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
+    dotenvy::dotenv().context("loading .env")?;
+
+    let token = std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
+    let intents = serenity::GatewayIntents::non_privileged();
+
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            commands: vec![current_event(), standings()],
+            ..Default::default()
+        })
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                let data: Data = match std::fs::read_to_string(REGISTRY) {
+                    Ok(contents) => serde_json::from_str(&contents)?,
+                    Err(_) => Data::default(),
+                };
+                Ok(GlobalState {
+                    data: RwLock::new(data),
+                })
+            })
+        })
+        .build();
+
+    let client = serenity::ClientBuilder::new(token, intents)
+        .framework(framework)
+        .await;
+    client.unwrap().start().await.unwrap();
 
     Ok(())
 }
