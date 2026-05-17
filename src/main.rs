@@ -36,10 +36,23 @@ fn event_url(event_id: u32) -> Url {
         .join(&format!("{event_id}/"))
         .expect("invalid path")
 }
-fn registrations(event_id: u32) -> Url {
-    event_url(event_id)
+fn registrations_url(event_id: u32, page_size: usize, page: u32, player_name: Option<&str>) -> Url {
+    let mut url = event_url(event_id)
         .join("registrations/")
-        .expect("invalid path")
+        .expect("invalid path");
+
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("page_size", &page_size.to_string())
+            .append_pair("page", &page.to_string());
+
+        if let Some(name) = player_name {
+            query.append_pair("name", name);
+        }
+    }
+
+    url
 }
 
 static ROUNDS_URL_BASE: Lazy<Url> =
@@ -95,6 +108,8 @@ struct Player {
 #[derive(Debug, Deserialize)]
 struct User {
     id: u32,
+    best_identifier: Option<String>,
+    initials: Option<String>,
     pronouns: Option<String>,
     country_code: Option<String>,
 }
@@ -288,6 +303,49 @@ impl Paginated for Matches {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RegistrationStatus {
+    Eliminated,
+    Complete,
+}
+
+#[derive(Debug, Deserialize)]
+struct Registration {
+    id: u32,
+    user: User,
+    registration_status: RegistrationStatus,
+    best_identifier: String,
+    matches_won: u32,
+    matches_lost: u32,
+    matches_drawn: u32,
+    total_match_points: u32,
+    final_place_in_standings: u32,
+    deck_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Registrations {
+    registrations: Vec<Registration>,
+}
+
+impl Paginated for Registrations {
+    type Single = Registration;
+
+    fn page_url(event_id: u32, page_size: usize, page: u32) -> Url {
+        registrations_url(event_id, page_size, page, None)
+    }
+
+    fn construct(pages: Vec<Vec<Registration>>) -> Self {
+        Registrations {
+            registrations: pages
+                .into_iter()
+                .flat_map(|page| page.into_iter())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum GenerationStatus {
     Generated,
     NotGenerated,
@@ -324,7 +382,7 @@ struct PhaseRound {
     status: RoundStatus,
 
     #[serde(flatten)]
-    other: HashMap<String, serde_json::Value>,
+    _other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,7 +403,7 @@ struct TournamentPhase {
     rounds: Vec<PhaseRound>,
 
     #[serde(flatten)]
-    other: HashMap<String, serde_json::Value>,
+    _other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,7 +413,58 @@ struct Event {
     starting_player_count: u32,
 
     #[serde(flatten)]
-    other: HashMap<String, serde_json::Value>,
+    _other: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+enum DeckFormat {
+    Constructed,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SectionType {
+    Main,
+    RunePool,
+    Sideboard,
+}
+
+#[derive(Debug, Deserialize)]
+struct Card {
+    id: String,
+    name: String,
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardEntry {
+    id: String,
+    quantity: usize,
+    foil: bool,
+    sort_order: usize,
+
+    card: Card,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecklistSection {
+    id: String,
+    name: String,
+    section_type: SectionType,
+    sort_order: u32,
+    cards: Vec<CardEntry>,
+}
+#[derive(Debug, Deserialize)]
+struct Decklist {
+    id: String,
+    name: String,
+    format: DeckFormat,
+    user: User,
+    card_count: u32,
+
+    sections: Vec<DecklistSection>,
 }
 
 #[derive(Debug, Parser)]
@@ -637,9 +746,15 @@ async fn standings(
         }),
     )?;
 
-    ctx.reply(format!(
-        "# {}\nStandings as of round {}```\n{table}\n```",
-        event.name, complete_round.round_number,
+    ctx.reply(indoc::formatdoc!(
+        "Standings as of round {}
+        ```
+        {table}
+        ```
+        -# Event: {}
+        -# Url: <https://locator.riftbound.uvsgames.com/events/{event_id}>",
+        complete_round.round_number,
+        event.name,
     ))
     .await?;
 
@@ -729,8 +844,130 @@ async fn journey(ctx: Context<'_>, player: String) -> anyhow::Result<()> {
         }),
     )?;
 
-    ctx.reply(format!("# {player}'s Journey\n```\n{table}\n```",))
-        .await?;
+    ctx.reply(indoc::formatdoc!(
+        "# {player}'s Journey
+        ```
+        {table}
+        ```
+        -# Event: {}
+        -# Url: <https://locator.riftbound.uvsgames.com/events/{event_id}>",
+        event.name,
+    ))
+    .await?;
+
+    Ok(())
+}
+
+#[poise::command(slash_command)]
+async fn best_of(ctx: Context<'_>, legend: String) -> anyhow::Result<()> {
+    ctx.defer().await?;
+
+    let locked = ctx
+        .channel_data()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+    let event_id = locked
+        .current_event
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+
+    let event = get_tournament(event_id).await?;
+
+    ctx.defer().await?;
+
+    let completed_phase = event
+        .tournament_phases
+        .iter()
+        .rfind(|p| {
+            matches!(p.status, RoundStatus::Complete | RoundStatus::InProgress)
+                && p.rounds
+                    .iter()
+                    .any(|r| matches!(r.status, RoundStatus::Complete))
+        })
+        .ok_or_else(|| anyhow::anyhow!("No candidate phase found"))?;
+
+    let complete_round = completed_phase
+        .rounds
+        .iter()
+        .rfind(|p| matches!(p.status, RoundStatus::Complete))
+        .ok_or_else(|| anyhow::anyhow!("No complete round found"))?;
+
+    let standings: Standings = get_paginated(complete_round.id, None).await?;
+
+    let legend_l = legend.to_lowercase();
+    for standing in standings.standings {
+        if let Some(ddc) = standing.user_event_status.deck_defining_card {
+            if ddc.name.to_lowercase().contains(&legend_l) {
+                ctx.reply(indoc::formatdoc!(
+                    "Best of `{}` was `{}` (Rank {}, Record {})
+
+                    -# Event: {}
+                    -# Url: <https://locator.riftbound.uvsgames.com/events/{event_id}>",
+                    ddc.name,
+                    standing.user_event_status.best_identifier,
+                    standing.rank,
+                    standing.record,
+                    event.name,
+                ))
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("No best-of found for `{legend}`"))
+}
+
+#[poise::command(slash_command)]
+async fn decklist(ctx: Context<'_>, player: String) -> anyhow::Result<()> {
+    ctx.defer().await?;
+
+    let locked = ctx
+        .channel_data()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+    let event_id = locked
+        .current_event
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+
+    let event = get_tournament(event_id).await?;
+
+    let registrations: PaginationResult<Registration> =
+        get_cached(registrations_url(event_id, 1, 1, Some(&player))).await?;
+    let registration = registrations
+        .results
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Player `{player}` not found"))?;
+    let deck_id = registration
+        .deck_id
+        .ok_or_else(|| anyhow::anyhow!("No decklist reported for `{player}`"))?;
+
+    let decklist: Decklist = get_cached(deck_url(&deck_id).context("invalid deck id")?).await?;
+
+    let mut response = String::new();
+    for section in decklist.sections {
+        writeln!(&mut response, "{}", section.name)?;
+        for card in section.cards {
+            writeln!(
+                &mut response,
+                "{} {}",
+                card.quantity, card.card.display_name
+            )?;
+        }
+        writeln!(&mut response)?;
+    }
+
+    ctx.reply(indoc::formatdoc!(
+        "# Decklist for {}
+        ```
+        {response}
+        ```
+        -# Event: {}
+        -# Url: <https://locator.riftbound.uvsgames.com/events/{event_id}>",
+        registration.best_identifier,
+        event.name
+    ))
+    .await?;
 
     Ok(())
 }
@@ -748,7 +985,13 @@ async fn main() -> anyhow::Result<()> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![current_event(), standings(), journey()],
+            commands: vec![
+                best_of(),
+                current_event(),
+                decklist(),
+                journey(),
+                standings(),
+            ],
             ..Default::default()
         })
         .setup(|ctx, _ready, framework| {
