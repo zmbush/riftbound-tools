@@ -3,7 +3,7 @@ use poise::serenity_prelude as serenity;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write as _,
-    io::Write as _,
+    io::Write,
     sync::Arc,
     time::Duration,
 };
@@ -49,14 +49,21 @@ fn tournament_rounds_url(event_id: u32) -> Url {
         .join(&format!("{event_id}/"))
         .expect("invalid path")
 }
-fn matches_url(event_id: u32, page_size: usize, page: u32) -> Url {
+fn matches_url(event_id: u32, page_size: usize, page: u32, player_name: Option<&str>) -> Url {
     let mut url = tournament_rounds_url(event_id)
         .join("matches/paginated/")
         .expect("invalid path");
 
-    url.query_pairs_mut()
-        .append_pair("page_size", &page_size.to_string())
-        .append_pair("page", &page.to_string());
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("page_size", &page_size.to_string())
+            .append_pair("page", &page.to_string());
+
+        if let Some(name) = player_name {
+            query.append_pair("player_name", name);
+        }
+    }
 
     url
 }
@@ -243,7 +250,7 @@ struct Match {
     player_match_relationships: Vec<PlayerMatchRelationship>,
 
     #[serde(flatten)]
-    results: Option<MatchResult>,
+    results: MatchResult,
 }
 
 fn get_table_number<'de, D>(d: D) -> Result<Option<u32>, <D as Deserializer<'de>>::Error>
@@ -266,7 +273,7 @@ impl Paginated for Matches {
     type Single = Match;
 
     fn page_url(id: u32, page_size: usize, page: u32) -> Url {
-        matches_url(id, page_size, page)
+        matches_url(id, page_size, page, None)
     }
 
     fn construct(pages: Vec<Vec<Match>>) -> Self {
@@ -515,6 +522,53 @@ async fn current_event(ctx: Context<'_>, event_url: String) -> anyhow::Result<()
     Ok(())
 }
 
+fn write_row<E: ToString, I: IntoIterator<Item = E>, W: Write>(
+    writer: &mut W,
+    row: I,
+) -> anyhow::Result<()> {
+    let mut first = true;
+    for header in row {
+        if first {
+            first = false;
+            write!(writer, "{}", header.to_string())?;
+        } else {
+            write!(writer, "\t{}", header.to_string())?;
+        }
+    }
+    writeln!(writer, "")?;
+
+    Ok(())
+}
+
+fn make_table<
+    HS: ToString,
+    H: IntoIterator<Item = HS>,
+    RS: ToString,
+    R: IntoIterator<Item = RS>,
+    Rows: IntoIterator<Item = R>,
+>(
+    headers: H,
+    rows: Rows,
+) -> anyhow::Result<String> {
+    let mut tw = TabWriter::new(vec![]).padding(2);
+    write_row(&mut tw, headers)?;
+    for row in rows {
+        write_row(&mut tw, row)?;
+    }
+    tw.flush()?;
+    let written = String::from_utf8(tw.into_inner()?)?;
+    let mut lines = written.lines();
+    let header = lines.next().unwrap();
+    let mut body = String::new();
+    let mut longest = header.len();
+    for line in lines {
+        longest = usize::max(longest, line.len());
+        writeln!(&mut body, "{line}")?;
+    }
+
+    Ok(format!("{header}\n{}\n{body}", "─".repeat(longest)))
+}
+
 #[poise::command(slash_command)]
 async fn standings(
     ctx: Context<'_>,
@@ -565,41 +619,118 @@ async fn standings(
         get_paginated(complete_round.id, Some(count.unwrap_or(20))).await?
     };
 
-    let mut tw = TabWriter::new(vec![]).padding(2);
-    writeln!(&mut tw, "#\tPlayer\tRecord\tLegend")?;
-    for standing in standings.standings {
-        writeln!(
-            &mut tw,
-            "{}\t{}\t{}\t{}",
-            standing.rank,
-            standing.user_event_status.best_identifier,
-            standing.record,
-            standing
-                .user_event_status
-                .deck_defining_card
-                .as_ref()
-                .map(|ddc| ddc.name.as_str())
-                .unwrap_or("UNKNOWN LEGEND"),
-        )?;
-    }
-    tw.flush()?;
-    let written = String::from_utf8(tw.into_inner()?)?;
-    let mut lines = written.lines();
-    let header = lines.next().unwrap();
-    let mut body = String::new();
-    let mut longest = 0;
-    for line in lines {
-        longest = usize::max(longest, line.len());
-        writeln!(&mut body, "{line}")?;
-    }
+    let table = make_table(
+        ["#", "Player", "Record", "Legend"],
+        standings.standings.iter().map(|standing| {
+            [
+                standing.rank.to_string(),
+                standing.user_event_status.best_identifier.clone(),
+                standing.record.clone(),
+                standing
+                    .user_event_status
+                    .deck_defining_card
+                    .as_ref()
+                    .map(|ddc| ddc.name.as_str())
+                    .unwrap_or("UNKNOWN LEGEND")
+                    .to_string(),
+            ]
+        }),
+    )?;
 
     ctx.reply(format!(
-        "# {}\nStandings as of round {}```\n{header}\n{}\n{body}\n```",
-        event.name,
-        complete_round.round_number,
-        "─".repeat(longest)
+        "# {}\nStandings as of round {}```\n{table}\n```",
+        event.name, complete_round.round_number,
     ))
     .await?;
+
+    Ok(())
+}
+
+#[poise::command(slash_command)]
+async fn journey(ctx: Context<'_>, player: String) -> anyhow::Result<()> {
+    ctx.defer().await?;
+
+    let locked = ctx
+        .channel_data()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+    let event_id = locked
+        .current_event
+        .ok_or_else(|| anyhow::anyhow!("No event configured"))?;
+
+    let event = get_tournament(event_id).await?;
+
+    let mut journey = Vec::new();
+    for phase in event.tournament_phases {
+        for round in phase.rounds {
+            if matches!(round.status, RoundStatus::Complete) {
+                let mut result: PaginationResult<Match> =
+                    get_cached(matches_url(round.id, 1, 1, Some(&player))).await?;
+                if !result.results.is_empty() {
+                    journey.push(result.results.remove(0));
+                }
+            }
+        }
+    }
+
+    let table = make_table(
+        ["Round", "Record", "Opponent", "Legend"],
+        journey.into_iter().enumerate().map(|(i, result)| {
+            if matches!(
+                result.results,
+                MatchResult::Complete(MatchResultCompleted::Bye)
+            ) {
+                [
+                    (i + 1).to_string(),
+                    "BYE".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ]
+            } else {
+                let opp = if result.player_match_relationships[0]
+                    .user_event_status
+                    .best_identifier
+                    == player
+                {
+                    &result.player_match_relationships[1]
+                } else {
+                    &result.player_match_relationships[0]
+                };
+
+                let record = match result.results {
+                    MatchResult::Complete(MatchResultCompleted::Tie { .. }) => "TIE".to_string(),
+                    MatchResult::Complete(MatchResultCompleted::Win {
+                        games_won_by_winner,
+                        games_won_by_loser,
+                        winning_player,
+                        ..
+                    }) => {
+                        if opp.user_event_status.user.id == winning_player {
+                            format!("{games_won_by_loser}:{games_won_by_winner} (L)")
+                        } else {
+                            format!("{games_won_by_winner}:{games_won_by_loser} (W)")
+                        }
+                    }
+                    _ => "?".to_string(),
+                };
+
+                [
+                    (i + 1).to_string(),
+                    record,
+                    opp.user_event_status.best_identifier.clone(),
+                    opp.user_event_status
+                        .deck_defining_card
+                        .as_ref()
+                        .map(|ddc| ddc.name.as_str())
+                        .unwrap_or("-")
+                        .to_string(),
+                ]
+            }
+        }),
+    )?;
+
+    ctx.reply(format!("# {player}'s Journey\n```\n{table}\n```",))
+        .await?;
 
     Ok(())
 }
@@ -617,7 +748,7 @@ async fn main() -> anyhow::Result<()> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![current_event(), standings()],
+            commands: vec![current_event(), standings(), journey()],
             ..Default::default()
         })
         .setup(|ctx, _ready, framework| {
