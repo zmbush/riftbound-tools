@@ -159,13 +159,71 @@ struct PlayerMatchRelationship {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MatchResultCompleted {
+    /// A winning player! There is a result.
+    Win {
+        games_drawn: u32,
+        games_won_by_winner: u32,
+        games_won_by_loser: u32,
+        winning_player: u32,
+    },
+
+    /// A result with no winning player means a tie.
+    Tie {
+        games_drawn: u32,
+        games_won_by_winner: u32,
+        games_won_by_loser: u32,
+        match_is_intentional_draw: bool,
+        match_is_unintentional_draw: bool,
+    },
+
+    Bye,
+}
+
+#[derive(Debug)]
+enum MatchResult {
+    Complete(MatchResultCompleted),
+    InProgress,
+}
+
+impl<'de> Deserialize<'de> for MatchResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MatchResultInner {
+            match_is_bye: bool,
+
+            #[serde(flatten)]
+            complete: Option<MatchResultCompleted>,
+        }
+        let result = MatchResultInner::deserialize(deserializer)?;
+
+        Ok(match result {
+            MatchResultInner {
+                match_is_bye: true, ..
+            } => MatchResult::Complete(MatchResultCompleted::Bye),
+            MatchResultInner { complete: None, .. } => MatchResult::InProgress,
+            MatchResultInner {
+                complete: Some(result),
+                ..
+            } => MatchResult::Complete(result),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct Match {
     id: u32,
     status: MatchStatus,
     #[serde(deserialize_with = "get_table_number")]
     table_number: Option<u32>,
-    match_is_bye: bool,
     player_match_relationships: Vec<PlayerMatchRelationship>,
+
+    #[serde(flatten)]
+    results: Option<MatchResult>,
 }
 
 fn get_table_number<'de, D>(d: D) -> Result<Option<u32>, <D as Deserializer<'de>>::Error>
@@ -173,9 +231,9 @@ where
     D: Deserializer<'de>,
 {
     if let Ok(number) = Deserialize::deserialize(d) {
-        return Ok(Some(number));
+        Ok(Some(number))
     } else {
-        return Ok(None);
+        Ok(None)
     }
 }
 
@@ -375,9 +433,10 @@ async fn main() -> anyhow::Result<()> {
     println!("Completed Round {}", complete_round.round_number);
     println!("Running Round {}", running_round.round_number);
 
-    let matches: Matches =
-        get_paginated(tournament.tournament_phases[0].rounds[0].id, None).await?;
-    println!("matches: {matches:?}");
+    let matches: Matches = get_paginated(running_round.id, None).await?;
+    for mat in matches.matches {
+        println!("{} -> {:?}", mat.id, mat.results);
+    }
     return Ok(());
 
     let standings: Standings = get_paginated(complete_round.id, args.by_rank).await?;
